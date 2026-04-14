@@ -13,6 +13,10 @@ library(plotly)
 library(colourpicker)
 library(scales)
 library(splines)
+library(ggrepel)
+library(gstat)
+library(sp)
+library(png)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS & PALETTES
@@ -89,6 +93,100 @@ JOURNAL_PRESETS <- list(
   "PowerPoint (16:9)"     = list(w = 13.3, h = 7.5,   dpi = 150, fmt = "png"),
   "Poster (A0)"           = list(w = 16,   h = 10,    dpi = 300, fmt = "png")
 )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONTOUR MAP — GLOBAL DATA & CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Resolve app directory robustly (works both interactively and via Rscript) ─
+.app_dir <- tryCatch(
+  normalizePath(getSrcDirectory(function() {})),
+  error = function(e) getwd()
+)
+
+# ── Groundwater and NAPL data ─────────────────────────────────────────────────
+GW_DATA <- tryCatch(
+  read.csv(file.path(.app_dir, "groundwater_elevations.csv"),
+           stringsAsFactors = FALSE, check.names = FALSE),
+  error = function(e) NULL
+)
+
+NAPL_DATA <- tryCatch(
+  read.csv(file.path(.app_dir, "napl_locations_summary.csv"),
+           stringsAsFactors = FALSE, check.names = FALSE),
+  error = function(e) NULL
+)
+
+# ── Background image extent in real-world coords (Easting / Northing, metres) ─
+# Derived from least-squares affine georeferencing of the borehole location plan
+# PDF using 18 ground control points (borehole circles).  RMSE < 1 mm.
+# Transform:  E =  0.2642162 * px_pdf − 18.31373
+#             N = −0.2642147 * py_pdf + 185.18993
+# Full PDF page (612 × 792 pts at 72 dpi) maps to the extents below.
+IMG_EXTENT <- list(
+  xmin = -18.314,   # E at px=0
+  xmax =  143.389,  # E at px=612
+  ymin =  -24.066,  # N at py=792 (bottom of page)
+  ymax =  185.190   # N at py=0   (top of page)
+)
+
+# ── Site boundary polygon (Easting / Northing) ───────────────────────────────
+# Extracted from DWG drawing via georeferenced PDF path tracing (17-vertex polygon)
+SITE_BOUNDARY <- data.frame(
+  E = c(71.298, 65.304, 91.356, 86.745, 63.229, 64.612, 47.551, 46.860,
+        39.252, 39.713, 36.254, 37.177, 40.865, 42.249, 35.563, 35.563,
+        43.271, 71.298),
+  N = c(145.114,  76.180,  74.105,  23.614,  25.690,  46.208,  47.822,
+         43.673,  44.595,  48.975,  49.206,  56.583,  56.122,  73.183,
+         73.644,  75.488, 146.959, 145.114)
+)
+
+# ── Background PNG (288 DPI raster of borehole location plan PDF) ─────────────
+BOREHOLE_PNG <- tryCatch(
+  png::readPNG(file.path(.app_dir, "borehole_plan.png")),
+  error = function(e) NULL
+)
+
+# ── Contour colour palettes ───────────────────────────────────────────────────
+CONTOUR_PALETTES <- list(
+  "Groundwater (Blues)"  = c("#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"),
+  "Blue-Red (Diverging)"  = c("#313695", "#4575b4", "#74add1", "#abd9e9", "#e0f3f8",
+                                   "#fee090", "#fdae61", "#f46d43", "#d73027", "#a50026"),
+  "Blues (Sequential)"   = c("#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6",
+                               "#4292c6", "#2171b5", "#08519c", "#08306b"),
+  "Viridis"              = c("#440154", "#482878", "#3e4989", "#31688e", "#26828e",
+                               "#1f9e89", "#35b779", "#6ece58", "#b5de2b", "#fde725"),
+  "Terrain"              = c("#1a9641", "#a6d96a", "#ffffbf", "#fdae61", "#d7191c"),
+  "Classic Academic"     = c("#2a4f6e", "#1a6b6b", "#2e6b45", "#7a5318", "#8b3a1e")
+)
+
+# ── Flow-arrow helper: estimate downhill direction at each borehole ───────────
+compute_flow_arrows <- function(gw, arrow_len = 4, search_r = 40) {
+  n   <- nrow(gw)
+  res <- data.frame(E = gw$Easting, N = gw$Northing, dE = 0, dN = 0)
+  gw_elev <- gw[["GW_Elevation_mamsl"]]
+  for (i in seq_len(n)) {
+    dx <- gw$Easting  - gw$Easting[i]
+    dy <- gw$Northing - gw$Northing[i]
+    d2 <- dx^2 + dy^2
+    ok <- d2 > 0.01 & d2 <= search_r^2
+    if (sum(ok) < 2L) next
+    dz <- gw_elev - gw_elev[i]
+    w  <- 1 / pmax(d2[ok], 0.1)
+    X  <- cbind(dx[ok], dy[ok])
+    XtW <- t(X * w)
+    g   <- tryCatch(
+      solve(XtW %*% X, XtW %*% dz[ok]),
+      error = function(e) c(0, 0)
+    )
+    len <- sqrt(g[1]^2 + g[2]^2)
+    if (len > 1e-8) {
+      res$dE[i] <- -g[1] / len * arrow_len
+      res$dN[i] <- -g[2] / len * arrow_len
+    }
+  }
+  res
+}
 
 # ── Water cut mapping for production years (C01–C10) ─────────────────────────
 WATER_CUTS <- c(0, 5, 25, 50, 65, 75, 85, 92, 95, 96.2)
@@ -799,7 +897,132 @@ ui <- page_navbar(
         )
       )
     )
+  ),
+
+  # ═══════════════════════════════════════════════════════
+  #  TAB 5: CONTOUR MAPS
+  # ═══════════════════════════════════════════════════════
+  nav_panel("Contour Maps", icon = icon("map"),
+    layout_sidebar(
+      fillable = TRUE,
+      sidebar = sidebar(
+        width = 310,
+        id    = "cmap_sidebar",
+
+        accordion(
+          id   = "acc_cmap",
+          open = c("Interpolation", "Layers"),
+
+          # ── INTERPOLATION ───────────────────────────────
+          accordion_panel("Interpolation", icon = icon("chart-area"),
+            selectInput("cmap_method", "Method",
+              choices  = c("IDW (Inverse Distance Weighting)" = "idw",
+                           "Kriging (Ordinary)"               = "kriging"),
+              selected = "idw"),
+            conditionalPanel("input.cmap_method === 'idw'",
+              sliderInput("cmap_idw_power", "IDW power (p)",
+                          min = 1, max = 4, value = 2, step = 0.5)
+            ),
+            sliderInput("cmap_grid_res", "Grid resolution (m)",
+                        min = 0.5, max = 5, value = 1, step = 0.5),
+            sliderInput("cmap_nlevels", "Contour levels",
+                        min = 5, max = 25, value = 12, step = 1)
+          ),
+
+          # ── LAYERS ─────────────────────────────────────
+          accordion_panel("Layers", icon = icon("layer-group"),
+            checkboxInput("cmap_show_bg",       "Background site plan",  value = TRUE),
+            conditionalPanel("input.cmap_show_bg",
+              sliderInput("cmap_bg_alpha", "Background opacity",
+                          min = 0.1, max = 1, value = 0.55, step = 0.05)
+            ),
+            checkboxInput("cmap_show_filled",   "Filled contours",       value = TRUE),
+            checkboxInput("cmap_show_lines",    "Contour lines",         value = TRUE),
+            checkboxInput("cmap_show_boundary", "Site boundary",         value = TRUE),
+            checkboxInput("cmap_show_boreholes","Borehole markers",      value = TRUE),
+            checkboxInput("cmap_show_labels",   "Borehole labels",       value = TRUE),
+            checkboxInput("cmap_show_napl",     "NAPL locations",        value = TRUE),
+            checkboxInput("cmap_show_flow",     "Flow direction arrows", value = FALSE)
+          ),
+
+          # ── APPEARANCE ─────────────────────────────────
+          accordion_panel("Appearance", icon = icon("palette"),
+            textInput("cmap_title",    "Map title",
+                      value = "Groundwater Elevation (mamsl)"),
+            textInput("cmap_subtitle", "Subtitle (optional)", value = ""),
+            selectInput("cmap_palette", "Colour palette",
+                        choices  = names(CONTOUR_PALETTES),
+                        selected = "Groundwater (Blues)"),
+            selectInput("cmap_line_col", "Contour line colour",
+                        choices  = c("Black"   = "#000000", "Dark Blue" = "#1a3a5e",
+                                     "Navy"    = "#2a4f6e", "White"     = "#ffffff",
+                                     "Grey"    = "#666666"),
+                        selected = "#1a3a5e"),
+            sliderInput("cmap_line_wt", "Contour line weight",
+                        min = 0.1, max = 1.5, value = 0.35, step = 0.05),
+            sliderInput("cmap_fill_alpha", "Fill opacity",
+                        min = 0.2, max = 1, value = 0.80, step = 0.05),
+            sliderInput("cmap_bh_size",  "Borehole marker size",
+                        min = 1, max = 6, value = 2.5, step = 0.25),
+            sliderInput("cmap_lbl_size", "Label font size",
+                        min = 1.5, max = 5, value = 2.5, step = 0.25),
+            numericInput("cmap_title_size", "Title font size",
+                         value = 14, min = 8, max = 28, step = 1),
+            numericInput("cmap_axis_size", "Axis label size",
+                         value = 11, min = 6, max = 20, step = 1)
+          ),
+
+          # ── EXPORT ─────────────────────────────────────
+          accordion_panel("Export", icon = icon("download"),
+            selectInput("cmap_preset", "Journal preset",
+                        choices  = names(JOURNAL_PRESETS),
+                        selected = "Custom"),
+            fluidRow(
+              column(6, numericInput("cmap_width",  "Width (in)",
+                                     value = 10, min = 1, max = 30, step = 0.5)),
+              column(6, numericInput("cmap_height", "Height (in)",
+                                     value = 8,  min = 1, max = 30, step = 0.5))
+            ),
+            numericInput("cmap_dpi", "DPI", value = 300, min = 72, max = 1200, step = 50),
+            selectInput("cmap_format", "Format",
+                        choices  = c("PDF" = "pdf", "PNG" = "png",
+                                     "SVG" = "svg", "TIFF" = "tiff"),
+                        selected = "pdf"),
+            textInput("cmap_filename", "Filename", value = "groundwater_contour"),
+            downloadButton("cmap_download", "Export Map",
+                           class = "btn-export w-100 mt-2")
+          )
+        )
+      ),  # ── end sidebar ──
+
+      # ── MAIN PANEL ───────────────────────────────────────
+      card(
+        full_screen = TRUE,
+        card_header(
+          div(class = "d-flex justify-content-between align-items-center",
+            span("Groundwater Elevation Contour Map"),
+            div(class = "d-flex align-items-center gap-3",
+              actionButton("cmap_refresh", "Refresh",
+                           class = "btn-ghost btn-sm", icon = icon("rotate")),
+              radioButtons("cmap_view", NULL,
+                           choices  = c("Static" = "static", "Interactive" = "interactive"),
+                           selected = "static", inline = TRUE)
+            )
+          )
+        ),
+        card_body(
+          class = "plot-container",
+          conditionalPanel("input.cmap_view === 'static'",
+            plotOutput("cmap_static", height = "650px", width = "100%")
+          ),
+          conditionalPanel("input.cmap_view === 'interactive'",
+            plotlyOutput("cmap_interactive", height = "650px")
+          )
+        )
+      )
+    )
   )
+
 )
 
 
@@ -3692,6 +3915,302 @@ server <- function(input, output, session) {
 
       if (fmt == "eps") {
         ggsave(file, plot = p, width = w, height = h, device = cairo_ps, bg = "white")
+      } else {
+        ggsave(file, plot = p, width = w, height = h, dpi = dpi,
+               device = fmt, bg = "white")
+      }
+    }
+  )
+
+  # ════════════════════════════════════════════════════════
+  #  CONTOUR MAPS
+  # ════════════════════════════════════════════════════════
+
+  # ── Sync export preset → width / height / dpi / format ──────────────────────
+  observeEvent(input$cmap_preset, {
+    p <- JOURNAL_PRESETS[[input$cmap_preset]]
+    if (!is.null(p)) {
+      updateNumericInput(session, "cmap_width",  value = p$w)
+      updateNumericInput(session, "cmap_height", value = p$h)
+      updateNumericInput(session, "cmap_dpi",    value = p$dpi)
+      updateSelectInput(session,  "cmap_format", selected = p$fmt)
+    }
+  })
+
+  # ── Interpolation grid (expensive — only reruns when interpolation params change) ──
+  contour_grid <- reactive({
+    req(GW_DATA)
+    gw     <- GW_DATA
+    method <- input$cmap_method
+    res    <- input$cmap_grid_res
+    power  <- if (method == "idw") input$cmap_idw_power else 2
+
+    pad  <- 8
+    xseq <- seq(floor(min(gw$Easting)  - pad), ceiling(max(gw$Easting)  + pad), by = res)
+    yseq <- seq(floor(min(gw$Northing) - pad), ceiling(max(gw$Northing) + pad), by = res)
+
+    # sp objects
+    sp_bh <- SpatialPointsDataFrame(
+      coords = gw[, c("Easting", "Northing")],
+      data   = data.frame(GW_elev = gw[["GW_Elevation_mamsl"]])
+    )
+
+    grd <- expand.grid(Easting = xseq, Northing = yseq)
+    coordinates(grd) <- ~Easting + Northing
+    gridded(grd)     <- TRUE
+
+    pred <- if (method == "kriging") {
+      vfit <- tryCatch({
+        v <- gstat::variogram(GW_elev ~ 1, sp_bh)
+        gstat::fit.variogram(v, gstat::vgm("Sph"))
+      }, error = function(e) gstat::vgm(0.5, "Sph", 50, 0.05))
+      kg <- gstat::gstat(formula = GW_elev ~ 1, data = sp_bh, model = vfit)
+      predict(kg, grd)
+    } else {
+      gstat::idw(GW_elev ~ 1, sp_bh, grd, idp = power)
+    }
+
+    df           <- as.data.frame(pred)
+    df$GW_elev   <- df$var1.pred
+    df
+  }) |> bindCache(input$cmap_method, input$cmap_idw_power, input$cmap_grid_res)
+
+  # ── Build the ggplot contour map ─────────────────────────────────────────────
+  build_contour_map <- reactive({
+    req(GW_DATA)
+    input$cmap_refresh   # manual refresh trigger
+
+    gw      <- GW_DATA
+    napl    <- NAPL_DATA
+    pred_df <- contour_grid()
+    pal     <- colorRampPalette(CONTOUR_PALETTES[[input$cmap_palette]])(256)
+
+    pad      <- 8
+    x_lo     <- min(gw$Easting)  - pad;  x_hi <- max(gw$Easting)  + pad
+    y_lo     <- min(gw$Northing) - pad;  y_hi <- max(gw$Northing) + pad
+    z_lo     <- min(pred_df$GW_elev, na.rm = TRUE)
+    z_hi     <- max(pred_df$GW_elev, na.rm = TRUE)
+    brks     <- pretty(c(z_lo, z_hi), n = input$cmap_nlevels)
+
+    p <- ggplot()
+
+    # ── Layer 1: background site plan ────────────────────
+    if (isTRUE(input$cmap_show_bg) && !is.null(BOREHOLE_PNG)) {
+      alpha   <- input$cmap_bg_alpha
+      bg      <- BOREHOLE_PNG
+      # Blend with white to control opacity (works for RGB arrays)
+      if (alpha < 1) bg <- alpha * bg + (1 - alpha)
+      p <- p + annotation_raster(
+        bg,
+        xmin = IMG_EXTENT$xmin, xmax = IMG_EXTENT$xmax,
+        ymin = IMG_EXTENT$ymin, ymax = IMG_EXTENT$ymax,
+        interpolate = TRUE
+      )
+    }
+
+    # ── Layer 2: filled contour surface ──────────────────
+    if (isTRUE(input$cmap_show_filled)) {
+      p <- p + geom_raster(
+        data        = pred_df,
+        aes(x = Easting, y = Northing, fill = GW_elev),
+        interpolate = TRUE,
+        alpha       = input$cmap_fill_alpha
+      ) + scale_fill_gradientn(
+        colours = pal,
+        limits  = c(z_lo, z_hi),
+        name    = "GW Elevation\n(mamsl)",
+        guide   = guide_colorbar(
+          barheight    = unit(6, "cm"),
+          barwidth     = unit(0.45, "cm"),
+          title.hjust  = 0.5,
+          label.theme  = element_text(size = 8),
+          title.theme  = element_text(size = 9, face = "bold")
+        )
+      )
+    }
+
+    # ── Layer 3: contour lines ────────────────────────────
+    if (isTRUE(input$cmap_show_lines)) {
+      p <- p + geom_contour(
+        data      = pred_df,
+        aes(x = Easting, y = Northing, z = GW_elev),
+        breaks    = brks,
+        colour    = input$cmap_line_col,
+        linewidth = input$cmap_line_wt
+      )
+    }
+
+    # ── Layer 4: site boundary ────────────────────────────
+    if (isTRUE(input$cmap_show_boundary)) {
+      p <- p + geom_path(
+        data      = SITE_BOUNDARY,
+        aes(x = E, y = N),
+        colour    = "#1a1714",
+        linewidth = 0.65,
+        linetype  = "solid"
+      )
+    }
+
+    # ── Layer 5: flow direction arrows ────────────────────
+    if (isTRUE(input$cmap_show_flow)) {
+      arrows <- compute_flow_arrows(gw)
+      p <- p + geom_segment(
+        data = arrows,
+        aes(x = E, y = N, xend = E + dE, yend = N + dN),
+        arrow     = arrow(length = unit(0.18, "cm"), type = "closed"),
+        colour    = "#2a4f6e",
+        linewidth = 0.45,
+        alpha     = 0.85
+      )
+    }
+
+    # ── Layer 6: all borehole markers ────────────────────
+    if (isTRUE(input$cmap_show_boreholes)) {
+      is_napl_bh <- if (!is.null(napl) && nrow(napl) > 0)
+                      gw$Borehole %in% napl$Borehole
+                    else
+                      rep(FALSE, nrow(gw))
+
+      # Regular boreholes
+      reg_bh <- gw[!is_napl_bh, ]
+      if (nrow(reg_bh) > 0) {
+        p <- p + geom_point(
+          data   = reg_bh,
+          aes(x = Easting, y = Northing),
+          shape  = 21, fill = "white", colour = "#1a1714",
+          size   = input$cmap_bh_size, stroke = 0.65
+        )
+      }
+
+      # NAPL boreholes (distinct marker)
+      if (isTRUE(input$cmap_show_napl) && any(is_napl_bh)) {
+        napl_bh <- gw[is_napl_bh, ]
+        p <- p + geom_point(
+          data   = napl_bh,
+          aes(x = Easting, y = Northing),
+          shape  = 24, fill = "#8b3a1e", colour = "#1a1714",
+          size   = input$cmap_bh_size + 0.8, stroke = 0.7
+        )
+      }
+    }
+
+    # ── Layer 7: borehole ID labels ───────────────────────
+    if (isTRUE(input$cmap_show_labels)) {
+      p <- p + ggrepel::geom_text_repel(
+        data              = gw,
+        aes(x = Easting, y = Northing, label = Borehole),
+        size              = input$cmap_lbl_size,
+        fontface          = "bold",
+        colour            = "#1a1714",
+        bg.colour         = "white",
+        bg.r              = 0.12,
+        segment.colour    = "#555555",
+        segment.size      = 0.3,
+        segment.linetype  = "dashed",
+        min.segment.length = 0.25,
+        box.padding       = 0.35,
+        point.padding     = 0.2,
+        max.overlaps      = Inf,
+        seed              = 42L
+      )
+    }
+
+    # ── North arrow ───────────────────────────────────────
+    nx <- x_hi - 2.5;  ny_base <- y_hi - 7
+    p <- p +
+      annotate("segment",
+               x = nx, xend = nx, y = ny_base, yend = ny_base + 5,
+               arrow     = arrow(length = unit(0.22, "cm"), type = "closed"),
+               colour    = "#1a1714", linewidth = 0.75) +
+      annotate("text",
+               x = nx, y = ny_base - 1.8, label = "N",
+               size = 3.5, fontface = "bold", colour = "#1a1714")
+
+    # ── Scale bar ─────────────────────────────────────────
+    sb_x0 <- x_lo + 1.5;  sb_y  <- y_lo + 2.5
+    p <- p +
+      annotate("segment",
+               x = sb_x0, xend = sb_x0 + 20, y = sb_y, yend = sb_y,
+               colour = "#1a1714", linewidth = 0.7) +
+      annotate("segment",
+               x = sb_x0,      xend = sb_x0,      y = sb_y - 0.6, yend = sb_y + 0.6,
+               colour = "#1a1714", linewidth = 0.5) +
+      annotate("segment",
+               x = sb_x0 + 20, xend = sb_x0 + 20, y = sb_y - 0.6, yend = sb_y + 0.6,
+               colour = "#1a1714", linewidth = 0.5) +
+      annotate("text",
+               x = sb_x0 + 10, y = sb_y + 2, label = "20 m",
+               size = 3, colour = "#1a1714")
+
+    # ── Coordinate system and theme ───────────────────────
+    p <- p +
+      coord_fixed(ratio = 1, xlim = c(x_lo, x_hi), ylim = c(y_lo, y_hi),
+                  expand = FALSE) +
+      labs(
+        title    = input$cmap_title,
+        subtitle = if (nchar(trimws(input$cmap_subtitle)) > 0)
+                     input$cmap_subtitle else NULL,
+        x        = "Easting (m)",
+        y        = "Northing (m)"
+      ) +
+      theme_academic(base_size = input$cmap_axis_size,
+                     grid = "none", border = TRUE) +
+      theme(
+        plot.title      = element_text(size  = input$cmap_title_size,
+                                       face  = "bold", hjust = 0.5),
+        plot.subtitle   = element_text(size  = rel(0.85), face = "italic",
+                                       hjust = 0.5, colour = "#666666"),
+        legend.position  = "right",
+        legend.key.size  = unit(0.9, "lines"),
+        legend.text      = element_text(size = 8),
+        legend.title     = element_text(size = 9, face = "bold"),
+        axis.title       = element_text(size = rel(0.9))
+      )
+
+    # ── Manual legend for NAPL marker ────────────────────
+    if (isTRUE(input$cmap_show_napl) && !is.null(napl) && nrow(napl) > 0 &&
+        isTRUE(input$cmap_show_boreholes)) {
+      p <- p + annotate("point",
+        x = x_lo - 999, y = y_lo - 999,    # off-canvas dummy
+        shape = 24, fill = "#8b3a1e", colour = "#1a1714", size = 3)
+    }
+
+    p
+  })
+
+  # ── Render: static plot ──────────────────────────────────────────────────────
+  output$cmap_static <- renderPlot({
+    build_contour_map()
+  }, res = 96, execOnResize = TRUE)
+
+  # ── Render: interactive plotly ───────────────────────────────────────────────
+  output$cmap_interactive <- renderPlotly({
+    p <- build_contour_map()
+    ggplotly(p, tooltip = c("x", "y", "fill")) |>
+      plotly::config(
+        displayModeBar  = TRUE,
+        displaylogo     = FALSE,
+        modeBarButtonsToRemove = list("lasso2d", "select2d")
+      ) |>
+      plotly::layout(
+        hoverlabel = list(bgcolor = "white",
+                          font    = list(family = "Inter", size = 12))
+      )
+  })
+
+  # ── Export handler ───────────────────────────────────────────────────────────
+  output$cmap_download <- downloadHandler(
+    filename = function() {
+      paste0(input$cmap_filename, ".", input$cmap_format)
+    },
+    content  = function(file) {
+      p   <- build_contour_map()
+      w   <- input$cmap_width
+      h   <- input$cmap_height
+      dpi <- input$cmap_dpi
+      fmt <- input$cmap_format
+      if (fmt == "svg") {
+        ggsave(file, plot = p, width = w, height = h, device = "svg",  bg = "white")
       } else {
         ggsave(file, plot = p, width = w, height = h, dpi = dpi,
                device = fmt, bg = "white")
